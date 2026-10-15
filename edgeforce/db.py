@@ -305,15 +305,6 @@ def backend_name():
     return 'SQLite (local/ephemeral)'
 
 
-def upcoming_quotes(sport=None, path=None, days=14):
-    """View-only upcoming quote subset; historical ledger is never pruned."""
-    from datetime import timedelta, datetime, timezone
-    now = datetime.now(timezone.utc)
-    until = now + timedelta(days=int(days))
-    return [q for q in latest_quotes(sport,path) if (ts := parse_utc(q.get('commence_time')))
-            and now - timedelta(hours=6) <= ts <= until]
-
-
 # The hosted app sets EDGEFORCE_POSTGRES_URL before importing this module.
 # All public ledger operations dispatch to Postgres in the cloud.
 if os.getenv('EDGEFORCE_POSTGRES_URL'):
@@ -323,5 +314,4 @@ if os.getenv('EDGEFORCE_POSTGRES_URL'):
                   'prediction_history', 'snapshot_counts', 'record_game_score',
                   'log_ticket', 'ticket_history', 'settle_ticket', 'backup_bytes'):
         globals()[_func] = getattr(_cloud, _func)
-    upcoming_quotes = _cloud.upcoming_quotes
     backend_name = lambda: 'PostgreSQL (durable hosted storage)'

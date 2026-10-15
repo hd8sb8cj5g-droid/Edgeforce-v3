@@ -9,8 +9,6 @@ import io
 import json
 import os
 import zipfile
-import threading
-import time
 from contextlib import contextmanager
 from datetime import timedelta, datetime, timezone
 from uuid import uuid4
@@ -20,60 +18,27 @@ from .db import utcnow as _utcnow
 
 
 _POOL = None
-_POOL_LOCK = threading.Lock()
 
 
 def _get_pool():
-    """Use only checked PostgreSQL connections; Neon can suspend idle sessions.
-
-    psycopg_pool does not validate connections on checkout unless `check` is
-    explicitly provided. Pool reuse without this can hand us a dead socket.
-    """
     global _POOL
-    with _POOL_LOCK:
-        if _POOL is None or getattr(_POOL, 'closed', False):
-            from psycopg_pool import ConnectionPool
-            from psycopg.rows import dict_row
-            url = os.getenv('EDGEFORCE_POSTGRES_URL')
-            if not url:
-                raise RuntimeError('Cloud storage requires EDGEFORCE_POSTGRES_URL in Streamlit secrets')
-            _POOL = ConnectionPool(
-                url, min_size=0, max_size=3, timeout=20, max_idle=40,
-                max_lifetime=300, check=ConnectionPool.check_connection,
-                kwargs={'row_factory': dict_row, 'connect_timeout': 15},
-            )
-        return _POOL
+    if _POOL is None:
+        from psycopg_pool import ConnectionPool
+        from psycopg.rows import dict_row
+        url=os.getenv('EDGEFORCE_POSTGRES_URL')
+        if not url:
+            raise RuntimeError('Cloud storage requires EDGEFORCE_POSTGRES_URL configured in Streamlit secrets')
+        _POOL=ConnectionPool(url,min_size=0,max_size=4,timeout=15,
+                             kwargs={'row_factory':dict_row,'connect_timeout':12})
+    return _POOL
 
 
 @contextmanager
 def connect(path=None):
-    """The pool's connection context commits/rolls back without an extra BEGIN.
-
-    Do not transparently replay writes: after a network failure their commit
-    status may be unknown, and replaying could duplicate audit evidence.
-    """
+    # Connection pool is shared by reruns, avoiding a new TLS handshake for each query.
     with _get_pool().connection() as conn:
-        yield conn
-
-
-def check_connection():
-    """Probe database health with no schema modifications or leaked secrets."""
-    with connect() as conn:
-        return conn.execute('SELECT 1 AS ready').fetchone() is not None
-
-
-def _read_with_retry(operation):
-    """Retry one failed read after a transient connection error, never writes."""
-    from psycopg import InterfaceError, OperationalError
-    from psycopg_pool import PoolTimeout
-    for attempt in range(2):
-        try:
-            return operation()
-        except (OperationalError, InterfaceError, PoolTimeout):
-            if attempt:
-                raise
-            # The pool drops failed connections; checked checkout reconnects.
-            time.sleep(0.15)
+        with conn.transaction():
+            yield conn
 
 
 TABLES={
@@ -120,7 +85,6 @@ def init_db(path=None):
         conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_event ON edgeforce.odds_snapshots(event_id,observed_at)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_close ON edgeforce.odds_snapshots(event_id,bookmaker,market,selection,point,observed_at)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_recent ON edgeforce.odds_snapshots(sport,event_id,bookmaker,market,selection,point,participant,observed_at)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_upcoming ON edgeforce.odds_snapshots(sport,commence_time,observed_at DESC)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_result_prediction ON edgeforce.settlements(prediction_id,recorded_at)')
         conn.execute('''CREATE OR REPLACE FUNCTION edgeforce.deny_audit_changes() RETURNS trigger
                 LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'append-only audit table'; END $$''')
@@ -136,10 +100,8 @@ def init_db(path=None):
 
 
 def _fetchall(sql,params=()):
-    def read():
-        with connect() as conn:
-            return [dict(x) for x in conn.execute(sql,params).fetchall()]
-    return _read_with_retry(read)
+    with connect() as conn:
+        return [dict(x) for x in conn.execute(sql,params).fetchall()]
 
 
 def insert_snapshots(quotes,path=None):
@@ -168,21 +130,6 @@ def latest_quotes(sport=None,path=None):
     return _fetchall(f'''SELECT DISTINCT ON (event_id,bookmaker,market,selection,point,participant) *
      FROM edgeforce.odds_snapshots {where}
      ORDER BY event_id,bookmaker,market,selection,point,participant,observed_at DESC,id DESC''',qs)
-
-
-def upcoming_quotes(sport=None, path=None, days=14):
-    """Recent/upcoming market quotes for a fast mobile view, without pruning history."""
-    today=datetime.now(timezone.utc)
-    start=(today-timedelta(days=1)).strftime('%Y-%m-%d')
-    end=(today+timedelta(days=int(days)+2)).strftime('%Y-%m-%d')
-    where='WHERE commence_time >= %s AND commence_time < %s'
-    params=[start,end]
-    if sport:
-        where+=' AND sport = %s'
-        params.append(sport)
-    return _fetchall(f'''SELECT DISTINCT ON (event_id,bookmaker,market,selection,point,participant) *
-     FROM edgeforce.odds_snapshots {where}
-     ORDER BY event_id,bookmaker,market,selection,point,participant,observed_at DESC,id DESC''',tuple(params))
 
 
 def snapshots_for_event(event_id,path=None):
