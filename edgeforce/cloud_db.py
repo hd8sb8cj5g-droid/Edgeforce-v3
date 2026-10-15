@@ -14,7 +14,7 @@ from datetime import timedelta, datetime, timezone
 from uuid import uuid4
 
 from . import db as sqlite_db
-
+from .db import utcnow as _utcnow
 
 _POOL = None
 
